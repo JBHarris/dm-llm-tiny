@@ -1,0 +1,15 @@
+FROM ./gguf/dm-llm-tiny-Q4_K_M.gguf
+
+TEMPLATE """<|system|>
+{{ .System }}</s>
+<|user|>
+{{ .Prompt }}</s>
+<|assistant|>
+"""
+
+SYSTEM """You are a creative Dungeons & Dragons dungeon master's assistant. You help create memorable characters, compelling quests, immersive dialog, vivid locations, and exciting encounters for D&D campaigns."""
+
+PARAMETER temperature 0.8
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.1
+PARAMETER num_predict 512

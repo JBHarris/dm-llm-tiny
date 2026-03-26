@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import torch; print\\(torch.cuda.is_available\\(\\), torch.cuda.get_device_name\\(0\\) if torch.cuda.is_available\\(\\) else ''no gpu''\\)\")",
+      "Bash(pip3 list:*)",
+      "Bash(python3 -c \"import venv; print\\(''''venv available''''\\)\")",
+      "Bash(chmod:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}

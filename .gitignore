@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+data/
+output/
+merged_model/
+gguf/
+*.gguf
+wandb/
+*.log
+.ipynb_checkpoints/
