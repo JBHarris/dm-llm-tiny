@@ -18,15 +18,14 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    TrainingArguments,
 )
-from trl import SFTTrainer
+from trl import SFTConfig, SFTTrainer
 
 # --- Configuration ---
 BASE_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 DATA_FILE = Path("data/dnd_training.jsonl")
 OUTPUT_DIR = Path("output")
-MAX_SEQ_LENGTH = 1024
+MAX_SEQ_LENGTH = 2048
 
 # QLoRA config
 LORA_R = 64
@@ -35,7 +34,7 @@ LORA_DROPOUT = 0.05
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 # Training hyperparameters
-EPOCHS = 3
+EPOCHS = 5
 BATCH_SIZE = 4
 GRADIENT_ACCUMULATION = 4
 LEARNING_RATE = 2e-4
@@ -109,7 +108,7 @@ def main():
     print(f"Train: {len(dataset['train'])} examples, Eval: {len(dataset['test'])} examples")
 
     # Training arguments
-    training_args = TrainingArguments(
+    training_args = SFTConfig(
         output_dir=str(OUTPUT_DIR),
         num_train_epochs=EPOCHS,
         per_device_train_batch_size=BATCH_SIZE,
@@ -129,7 +128,7 @@ def main():
         optim="paged_adamw_8bit",
         report_to="none",
         max_grad_norm=0.3,
-        group_by_length=True,
+        max_length=MAX_SEQ_LENGTH,
     )
 
     # SFT Trainer
@@ -139,7 +138,6 @@ def main():
         train_dataset=dataset["train"],
         eval_dataset=dataset["test"],
         processing_class=tokenizer,
-        max_seq_length=MAX_SEQ_LENGTH,
     )
 
     print("Starting training...")

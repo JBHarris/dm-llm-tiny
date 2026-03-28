@@ -1,34 +1,32 @@
 """
-Step 1: Generate synthetic D&D training data using Claude API.
+Step 1 (alt): Generate synthetic D&D training data using a local Ollama instance.
 
-Generates instruction/response pairs for:
-- Character creation (NPCs, villains, party members)
-- Quest hooks and full quest outlines
-- Dialog lines and conversations
-- Location/dungeon descriptions
-- Encounter design
+Drop-in replacement for 01_generate_data.py that hits a local Ollama model
+(default: L3.1-8B-Stheno) via its OpenAI-compatible API.
 
-Output: data/dnd_training.jsonl
+Generates the same output format: data/dnd_training.jsonl
+
+Usage:
+    python 01_generate_data_ollama.py
+    python 01_generate_data_ollama.py --model some-other-model --num 500
 """
 
+import argparse
 import json
-import os
 import random
 import time
 from pathlib import Path
 
-from anthropic import Anthropic
-from dotenv import load_dotenv
-from google import genai
-
-load_dotenv()
+import requests
 
 # --- Configuration ---
-NUM_EXAMPLES = 900  # Total examples to generate (increase for better results)
+DEFAULT_MODEL = "L3.1-8B-Stheno"
+OLLAMA_BASE_URL = "http://localhost:11434"
+NUM_EXAMPLES = 900
 OUTPUT_DIR = Path("data")
 OUTPUT_FILE = OUTPUT_DIR / "dnd_training.jsonl"
 
-# --- Prompt categories ---
+# --- Reuse the same categories/prompts as the Claude version ---
 CATEGORIES = {
     "npc_character": {
         "weight": 20,
@@ -171,19 +169,32 @@ SYSTEM_MESSAGE = (
 )
 
 
-def generate_example_claude(client: Anthropic, category: str, info: dict) -> dict:
-    """Generate a single training example using Claude."""
+def generate_example_ollama(
+    base_url: str, model: str, category: str, info: dict
+) -> dict:
+    """Generate a single training example using a local Ollama instance."""
     base_prompt = random.choice(info["prompts"])
     user_prompt = build_prompt(category, base_prompt)
 
-    response = client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=2000,
-        system=info["system"],
-        messages=[{"role": "user", "content": user_prompt}],
+    response = requests.post(
+        f"{base_url}/api/chat",
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": info["system"]},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": False,
+            "options": {
+                "temperature": 0.8,
+                "num_predict": 2048,
+            },
+        },
+        timeout=300,
     )
-
-    assistant_text = response.content[0].text
+    response.raise_for_status()
+    data = response.json()
+    assistant_text = data["message"]["content"]
 
     return {
         "messages": [
@@ -195,43 +206,44 @@ def generate_example_claude(client: Anthropic, category: str, info: dict) -> dic
     }
 
 
-def generate_example_gemini(client: genai.Client, category: str, info: dict) -> dict:
-    """Generate a single training example using Gemini."""
-    base_prompt = random.choice(info["prompts"])
-    user_prompt = build_prompt(category, base_prompt)
+def check_ollama(base_url: str, model: str):
+    """Verify Ollama is running and the model is available."""
+    try:
+        r = requests.get(f"{base_url}/api/tags", timeout=5)
+        r.raise_for_status()
+    except requests.ConnectionError:
+        raise RuntimeError(
+            f"Cannot connect to Ollama at {base_url}. "
+            "Make sure Ollama is running (ollama serve)."
+        )
 
-    full_prompt = f"{info['system']}\n\n{user_prompt}"
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=full_prompt,
-    )
-
-    assistant_text = response.text
-
-    return {
-        "messages": [
-            {"role": "system", "content": SYSTEM_MESSAGE},
-            {"role": "user", "content": user_prompt},
-            {"role": "assistant", "content": assistant_text},
-        ],
-        "category": category,
-    }
+    models = [m["name"] for m in r.json().get("models", [])]
+    # Check if model name matches (with or without :latest tag)
+    matched = any(m == model or m.startswith(f"{model}:") for m in models)
+    if not matched:
+        print(f"WARNING: Model '{model}' not found in Ollama. Available: {models}")
+        print(f"You may need to run: ollama pull {model}")
+        raise RuntimeError(f"Model '{model}' not available in Ollama")
 
 
 def main():
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-    gemini_key = os.environ.get("GEMINI_API_KEY")
+    parser = argparse.ArgumentParser(
+        description="Generate D&D training data using a local Ollama model"
+    )
+    parser.add_argument(
+        "--model", default=DEFAULT_MODEL, help=f"Ollama model name (default: {DEFAULT_MODEL})"
+    )
+    parser.add_argument(
+        "--num", type=int, default=NUM_EXAMPLES, help=f"Number of examples (default: {NUM_EXAMPLES})"
+    )
+    parser.add_argument(
+        "--url", default=OLLAMA_BASE_URL, help=f"Ollama base URL (default: {OLLAMA_BASE_URL})"
+    )
+    args = parser.parse_args()
 
-    if not anthropic_key:
-        raise ValueError("Set ANTHROPIC_API_KEY in your .env file")
-
-    claude_client = Anthropic(api_key=anthropic_key)
-    gemini_client = genai.Client(api_key=gemini_key) if gemini_key else None
-
-    if gemini_client:
-        print("Using both Claude and Gemini for data generation")
-    else:
-        print("GEMINI_API_KEY not set, using Claude only")
+    print(f"Using Ollama model: {args.model} at {args.url}")
+    check_ollama(args.url, args.model)
+    print("Ollama connection verified.")
 
     OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -244,47 +256,36 @@ def main():
     if OUTPUT_FILE.exists():
         with open(OUTPUT_FILE) as f:
             existing = sum(1 for _ in f)
-        print(f"Found {existing} existing examples, generating {NUM_EXAMPLES - existing} more...")
+        print(f"Found {existing} existing examples, will append new ones...")
 
-    examples_needed = NUM_EXAMPLES - existing
+    examples_needed = args.num - existing
     if examples_needed <= 0:
         print(f"Already have {existing} examples. Delete {OUTPUT_FILE} to regenerate.")
         return
 
     print(f"Generating {examples_needed} D&D training examples...")
     category_counts = {}
-    source_counts = {"claude": 0, "gemini": 0}
+    generated = 0
 
     with open(OUTPUT_FILE, "a") as f:
         for i in range(examples_needed):
             cat, info = random.choice(weighted_categories)
             category_counts[cat] = category_counts.get(cat, 0) + 1
 
-            # Alternate between Claude and Gemini (50/50 split)
-            use_gemini = gemini_client and (i % 2 == 1)
-
             try:
-                if use_gemini:
-                    example = generate_example_gemini(gemini_client, cat, info)
-                    source = "gemini"
-                else:
-                    example = generate_example_claude(claude_client, cat, info)
-                    source = "claude"
-
+                example = generate_example_ollama(args.url, args.model, cat, info)
                 f.write(json.dumps(example) + "\n")
                 f.flush()
-                source_counts[source] += 1
-
-                print(f"  [{i + 1}/{examples_needed}] Generated ({cat}) [{source}]")
+                generated += 1
+                print(f"  [{i + 1}/{examples_needed}] Generated ({cat})")
 
             except Exception as e:
                 print(f"  Error on example {i + 1}: {e}")
-                time.sleep(5)
+                time.sleep(2)
                 continue
 
-    print(f"\nDone! Generated {examples_needed} examples.")
+    print(f"\nDone! Generated {generated} examples.")
     print(f"Category breakdown: {category_counts}")
-    print(f"Source breakdown: {source_counts}")
     print(f"Output: {OUTPUT_FILE}")
 
 

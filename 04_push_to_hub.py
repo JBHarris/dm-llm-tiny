@@ -97,7 +97,7 @@ def main():
 
     # Write model card
     readme_path = MERGED_DIR / "README.md"
-    readme_path.write_text(MODEL_CARD)
+    readme_path.write_text(MODEL_CARD, encoding="utf-8")
 
     # Upload merged model
     print(f"Uploading merged model to {HF_REPO}...")

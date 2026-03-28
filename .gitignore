@@ -10,3 +10,4 @@ gguf/
 wandb/
 *.log
 .ipynb_checkpoints/
+.claude/

@@ -1,34 +1,41 @@
 """
-Step 1: Generate synthetic D&D training data using Claude API.
+Step 1 (alt): Generate synthetic D&D training data using a local vLLM server.
 
-Generates instruction/response pairs for:
-- Character creation (NPCs, villains, party members)
-- Quest hooks and full quest outlines
-- Dialog lines and conversations
-- Location/dungeon descriptions
-- Encounter design
+Drop-in replacement for 01_generate_data.py that hits a vLLM instance
+via its OpenAI-compatible API (default: http://localhost:8000).
 
-Output: data/dnd_training.jsonl
+Sends concurrent async requests so vLLM's continuous batching engine
+can process multiple generations in parallel.
+
+Generates the same output format: data/dnd_training.jsonl
+
+Start vLLM first:
+    vllm serve hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4 --max-model-len 4096
+
+Usage:
+    python 01_generate_data_local.py
+    python 01_generate_data_local.py --model hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4 --num 500
+    python 01_generate_data_local.py --concurrency 16
 """
 
+import argparse
+import asyncio
 import json
-import os
 import random
 import time
 from pathlib import Path
 
-from anthropic import Anthropic
-from dotenv import load_dotenv
-from google import genai
-
-load_dotenv()
+from openai import AsyncOpenAI, OpenAI
 
 # --- Configuration ---
-NUM_EXAMPLES = 900  # Total examples to generate (increase for better results)
+DEFAULT_MODEL = "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+VLLM_BASE_URL = "http://localhost:8000/v1"
+NUM_EXAMPLES = 2500
+CONCURRENCY = 8  # Number of requests in flight at once
 OUTPUT_DIR = Path("data")
 OUTPUT_FILE = OUTPUT_DIR / "dnd_training.jsonl"
 
-# --- Prompt categories ---
+# --- Prompt categories (same as Claude version) ---
 CATEGORIES = {
     "npc_character": {
         "weight": 20,
@@ -171,19 +178,24 @@ SYSTEM_MESSAGE = (
 )
 
 
-def generate_example_claude(client: Anthropic, category: str, info: dict) -> dict:
-    """Generate a single training example using Claude."""
+async def generate_example(
+    client: AsyncOpenAI, model: str, category: str, info: dict
+) -> dict:
+    """Generate a single training example via the vLLM OpenAI-compatible API."""
     base_prompt = random.choice(info["prompts"])
     user_prompt = build_prompt(category, base_prompt)
 
-    response = client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=2000,
-        system=info["system"],
-        messages=[{"role": "user", "content": user_prompt}],
+    response = await client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": info["system"]},
+            {"role": "user", "content": user_prompt},
+        ],
+        max_tokens=2048,
+        temperature=0.8,
     )
 
-    assistant_text = response.content[0].text
+    assistant_text = response.choices[0].message.content
 
     return {
         "messages": [
@@ -195,43 +207,49 @@ def generate_example_claude(client: Anthropic, category: str, info: dict) -> dic
     }
 
 
-def generate_example_gemini(client: genai.Client, category: str, info: dict) -> dict:
-    """Generate a single training example using Gemini."""
-    base_prompt = random.choice(info["prompts"])
-    user_prompt = build_prompt(category, base_prompt)
+def check_vllm(base_url: str, model: str):
+    """Verify vLLM is running and the model is available."""
+    sync_client = OpenAI(base_url=base_url, api_key="unused")
+    try:
+        models = sync_client.models.list()
+    except Exception as e:
+        raise RuntimeError(
+            f"Cannot connect to vLLM server. Make sure it's running.\n"
+            f"Start it with: vllm serve {model} --max-model-len 4096\n"
+            f"Error: {e}"
+        )
 
-    full_prompt = f"{info['system']}\n\n{user_prompt}"
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=full_prompt,
-    )
-
-    assistant_text = response.text
-
-    return {
-        "messages": [
-            {"role": "system", "content": SYSTEM_MESSAGE},
-            {"role": "user", "content": user_prompt},
-            {"role": "assistant", "content": assistant_text},
-        ],
-        "category": category,
-    }
+    available = [m.id for m in models.data]
+    if model not in available:
+        print(f"WARNING: Model '{model}' not found. Available: {available}")
+        if available:
+            print(f"Hint: try --model {available[0]}")
+        raise RuntimeError(f"Model '{model}' not served by vLLM")
 
 
-def main():
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-    gemini_key = os.environ.get("GEMINI_API_KEY")
+async def worker(
+    semaphore: asyncio.Semaphore,
+    client: AsyncOpenAI,
+    model: str,
+    index: int,
+    total: int,
+    category: str,
+    info: dict,
+) -> dict | None:
+    """Worker that respects the concurrency semaphore."""
+    async with semaphore:
+        try:
+            example = await generate_example(client, model, category, info)
+            print(f"  [{index}/{total}] Generated ({category})")
+            return example
+        except Exception as e:
+            print(f"  Error on example {index}: {e}")
+            return None
 
-    if not anthropic_key:
-        raise ValueError("Set ANTHROPIC_API_KEY in your .env file")
 
-    claude_client = Anthropic(api_key=anthropic_key)
-    gemini_client = genai.Client(api_key=gemini_key) if gemini_key else None
-
-    if gemini_client:
-        print("Using both Claude and Gemini for data generation")
-    else:
-        print("GEMINI_API_KEY not set, using Claude only")
+async def run(args):
+    check_vllm(args.url, args.model)
+    print("vLLM connection verified.")
 
     OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -244,48 +262,69 @@ def main():
     if OUTPUT_FILE.exists():
         with open(OUTPUT_FILE) as f:
             existing = sum(1 for _ in f)
-        print(f"Found {existing} existing examples, generating {NUM_EXAMPLES - existing} more...")
+        print(f"Found {existing} existing examples, will append new ones...")
 
-    examples_needed = NUM_EXAMPLES - existing
+    examples_needed = args.num - existing
     if examples_needed <= 0:
         print(f"Already have {existing} examples. Delete {OUTPUT_FILE} to regenerate.")
         return
 
-    print(f"Generating {examples_needed} D&D training examples...")
+    print(
+        f"Generating {examples_needed} D&D training examples "
+        f"({args.concurrency} concurrent requests)..."
+    )
+
+    client = AsyncOpenAI(base_url=args.url, api_key="unused")
+    semaphore = asyncio.Semaphore(args.concurrency)
+
+    # Build all tasks up front
+    tasks = []
     category_counts = {}
-    source_counts = {"claude": 0, "gemini": 0}
+    for i in range(examples_needed):
+        cat, info = random.choice(weighted_categories)
+        category_counts[cat] = category_counts.get(cat, 0) + 1
+        tasks.append(worker(semaphore, client, args.model, i + 1, examples_needed, cat, info))
 
+    start = time.time()
+    results = await asyncio.gather(*tasks)
+    elapsed = time.time() - start
+
+    generated = 0
     with open(OUTPUT_FILE, "a") as f:
-        for i in range(examples_needed):
-            cat, info = random.choice(weighted_categories)
-            category_counts[cat] = category_counts.get(cat, 0) + 1
+        for result in results:
+            if result is not None:
+                f.write(json.dumps(result) + "\n")
+                generated += 1
 
-            # Alternate between Claude and Gemini (50/50 split)
-            use_gemini = gemini_client and (i % 2 == 1)
-
-            try:
-                if use_gemini:
-                    example = generate_example_gemini(gemini_client, cat, info)
-                    source = "gemini"
-                else:
-                    example = generate_example_claude(claude_client, cat, info)
-                    source = "claude"
-
-                f.write(json.dumps(example) + "\n")
-                f.flush()
-                source_counts[source] += 1
-
-                print(f"  [{i + 1}/{examples_needed}] Generated ({cat}) [{source}]")
-
-            except Exception as e:
-                print(f"  Error on example {i + 1}: {e}")
-                time.sleep(5)
-                continue
-
-    print(f"\nDone! Generated {examples_needed} examples.")
+    print(f"\nDone! Generated {generated} examples in {elapsed:.1f}s.")
     print(f"Category breakdown: {category_counts}")
-    print(f"Source breakdown: {source_counts}")
     print(f"Output: {OUTPUT_FILE}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate D&D training data using a local vLLM server"
+    )
+    parser.add_argument(
+        "--model", default=DEFAULT_MODEL,
+        help=f"Model name as served by vLLM (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--num", type=int, default=NUM_EXAMPLES,
+        help=f"Number of examples (default: {NUM_EXAMPLES})",
+    )
+    parser.add_argument(
+        "--url", default=VLLM_BASE_URL,
+        help=f"vLLM base URL (default: {VLLM_BASE_URL})",
+    )
+    parser.add_argument(
+        "--concurrency", type=int, default=CONCURRENCY,
+        help=f"Max concurrent requests to vLLM (default: {CONCURRENCY})",
+    )
+    args = parser.parse_args()
+
+    print(f"Using vLLM model: {args.model} at {args.url}")
+    asyncio.run(run(args))
 
 
 if __name__ == "__main__":

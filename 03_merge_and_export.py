@@ -61,7 +61,7 @@ def convert_to_gguf():
         )
         # Install conversion dependencies
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-r", "llama.cpp/requirements/requirements-convert_hf_to_gguf.txt"],
+            [sys.executable, "-m", "pip3", "install", "-r", "llama.cpp/requirements/requirements-convert_hf_to_gguf.txt"],
             check=True,
         )
 
@@ -86,7 +86,7 @@ def convert_to_gguf():
     print("Quantizing to Q4_K_M...")
 
     # Build llama-quantize if needed
-    quantize_bin = llama_cpp_path / "build" / "bin" / "llama-quantize"
+    quantize_bin = llama_cpp_path / "build" / "bin" / "Release" / "llama-quantize"
     if not quantize_bin.exists():
         print("Building llama.cpp quantize tool...")
         build_dir = llama_cpp_path / "build"
@@ -95,6 +95,11 @@ def convert_to_gguf():
         subprocess.run(["cmake", "--build", ".", "--config", "Release", "-t", "llama-quantize", "-j"], cwd=str(build_dir), check=True)
 
     quantized_file = GGUF_DIR / "dm-llm-tiny-Q4_K_M.gguf"
+
+    print(quantize_bin)
+    print(quantized_file)
+    print(output_file)
+    
     subprocess.run(
         [str(quantize_bin), str(output_file), str(quantized_file), "Q4_K_M"],
         check=True,
