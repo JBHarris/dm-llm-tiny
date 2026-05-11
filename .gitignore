@@ -11,3 +11,4 @@ wandb/
 *.log
 .ipynb_checkpoints/
 .claude/
+llama.cpp/
